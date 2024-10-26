@@ -1,0 +1,16 @@
+FROM golang:1.23.0
+
+ENV GO111MODULE=on \
+    CGO_ENABLED=0 \
+    GOOS=linux \
+    GOARCH=amd64
+
+# Set a working directory
+WORKDIR /go/src/app
+# Copy the package files
+COPY . .
+# Install all go_modules
+RUN go mod tidy
+
+# Build the project
+RUN go build -a -installsuffix cgo -o app ./bin
