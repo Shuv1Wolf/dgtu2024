@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	client1 "hack/client/version1"
 	"hack/data"
 	persist "hack/persistence"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	cconf "github.com/pip-services4/pip-services4-go/pip-services4-components-go/config"
 	exec "github.com/pip-services4/pip-services4-go/pip-services4-components-go/exec"
 	cref "github.com/pip-services4/pip-services4-go/pip-services4-components-go/refer"
+	"github.com/pip-services4/pip-services4-go/pip-services4-data-go/query"
 	log "github.com/pip-services4/pip-services4-go/pip-services4-observability-go/log"
 	ccmd "github.com/pip-services4/pip-services4-go/pip-services4-rpc-go/commands"
 	"golang.org/x/oauth2"
@@ -20,8 +22,16 @@ import (
 	"google.golang.org/api/fitness/v1"
 )
 
+const (
+	NONSTARTED = "not started"
+	PROGRESS   = "in progress"
+	FAILED     = "failed"
+	COMPLETED  = "completed"
+)
+
 type FitService struct {
 	persistence persist.IFitPersistence
+	client      client1.BackHttpClientV1
 	commandSet  *FitCommandSet
 
 	oauthConfig *oauth2.Config
@@ -29,18 +39,55 @@ type FitService struct {
 	timer  exec.FixedRateTimer
 	Logger *log.CompositeLogger
 
-	challenges      map[string]data.Challenge
-	localChallenges map[string]data.LocalCh
+	challenges      map[string][]data.Challenge
+	localChallenges map[string][]data.LocalCh
+
+	exist map[string]interface{}
 }
 
 func NewFitService() *FitService {
 	c := &FitService{}
 	c.Logger = log.NewCompositeLogger()
+
+	client := client1.NewBackHttpClientV1()
+
+	httpConfig := cconf.NewConfigParamsFromTuples(
+		"connection.protocol", "http",
+		"connection.port", "8001",
+		"connection.host", "89.46.131.17",
+	)
+	client.Configure(context.Background(), httpConfig)
+	client.Open(context.Background())
+
+	c.client = *client
+
 	redirectPort := os.Getenv("HTTP_REDIRECT_PORT")
 
 	c.timer = *exec.NewFixedRateTimerFromCallback(func(ctx context.Context) {
-		c.updateChalenges(ctx)
-		c.worker(ctx)
+		users, err := c.persistence.GetPage(ctx)
+		if err != nil || len(users.Data) == 0 {
+			return
+		}
+
+		mails := make([]string, 0, len(users.Data))
+
+		for _, user := range users.Data {
+			mails = append(mails, user.Mail)
+		}
+
+		ch, err := c.client.GetChallengesByMails(context.Background(), "trace", mails)
+		if err != nil || len(users.Data) == 0 {
+			return
+		}
+		lCh, err := c.client.GetGoalsByMails(context.Background(), "trace", mails)
+		if err != nil || len(users.Data) == 0 {
+			return
+		}
+
+		c.challenges = ch
+		c.localChallenges = lCh
+
+		c.worker(ctx, users)
 
 	}, 15000, 0, 1)
 
@@ -130,27 +177,128 @@ func (c *FitService) GoogleAuthorization(ctx context.Context, mail string) (stri
 	return url, nil
 }
 
-func (c *FitService) worker(ctx context.Context) {
-	users, err := c.persistence.GetPage(context.Background())
-	if err != nil || len(users.Data) == 0 {
-		return
-	}
+func (c *FitService) worker(ctx context.Context, users query.DataPage[data.FitV1]) {
 
-	// TODO:
 	for _, user := range users.Data {
-		steps, err := c.fetchStepData(user.Token, time.Now().Add(-50*time.Hour), time.Now())
-		if err != nil {
-			c.Logger.Error(ctx, err, "")
-			c.persistence.DeleteById(ctx, user.Id)
-		}
-		c.Logger.Info(ctx, fmt.Sprintf("%d", steps))
+		ch := c.challenges[user.Mail]
+		for _, i := range ch {
+			if i.Type == "step" || i.Type == "steps" {
 
-		sleep, err := c.fetchSleepData(user.Token, time.Now().Add(-50*time.Hour), time.Now())
-		if err != nil {
-			c.Logger.Error(ctx, err, "")
-			c.persistence.DeleteById(ctx, user.Id)
+				if time.Now().UTC().Before(i.Start) {
+					c.Logger.Debug(ctx, "не начат")
+					continue
+				}
+
+				steps, err := c.fetchStepData(user.Token, i.Start, i.End)
+				if err != nil {
+					c.Logger.Error(ctx, err, "")
+					c.persistence.DeleteById(ctx, user.Id)
+				}
+
+				if steps >= int64(i.Steps) {
+					c.Logger.Debug(ctx, "выполнен")
+
+					_, exist := c.exist[fmt.Sprintf("%d_%d", i.UserId, i.Id)]
+					if exist {
+						continue
+					}
+
+					c.client.AddAchievement(ctx, "trace", i.UserId, i.Id)
+					c.exist[fmt.Sprintf("%d_%d", i.UserId, i.Id)] = nil
+
+				} else if i.End.Before(time.Now().UTC()) {
+					c.Logger.Debug(ctx, "провален")
+				} else {
+					c.Logger.Debug(ctx, "порогресс")
+				}
+			}
+
+			if i.Type == "sleep" {
+
+				if time.Now().UTC().Before(i.Start) {
+					c.Logger.Debug(ctx, "НЕ НАЧАТ")
+					continue
+				}
+
+				sleep, err := c.fetchSleepData(user.Token, i.Start, i.End)
+				if err != nil {
+					c.Logger.Error(ctx, err, "")
+					c.persistence.DeleteById(ctx, user.Id)
+				}
+
+				if sleep >= int64(i.Sleep_millis) {
+					c.Logger.Debug(ctx, "выполнен")
+
+					_, exist := c.exist[fmt.Sprintf("%d_%d", i.UserId, i.Id)]
+					if exist {
+						continue
+					}
+
+					c.client.AddAchievement(ctx, "trace", i.UserId, i.Id)
+					c.exist[fmt.Sprintf("%d_%d", i.UserId, i.Id)] = nil
+
+				} else if i.End.Before(time.Now().UTC()) {
+					c.Logger.Debug(ctx, "провален")
+				} else {
+					c.Logger.Debug(ctx, "порогресс")
+				}
+			}
 		}
-		c.Logger.Info(ctx, fmt.Sprintf("%d", sleep))
+
+		lch := c.localChallenges[user.Mail]
+		for _, i := range lch {
+			if i.Type == "step" || i.Type == "steps" {
+
+				if time.Now().UTC().Before(i.Start) {
+					c.Logger.Debug(ctx, "НЕ НАЧАТ")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, NONSTARTED)
+					continue
+				}
+
+				steps, err := c.fetchStepData(user.Token, i.Start, i.End)
+				if err != nil {
+					c.Logger.Error(ctx, err, "")
+					c.persistence.DeleteById(ctx, user.Id)
+				}
+
+				if steps >= int64(i.Steps) {
+					c.Logger.Debug(ctx, "выполнен")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, COMPLETED)
+				} else if i.End.Before(time.Now().UTC()) {
+					c.Logger.Debug(ctx, "провален")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, FAILED)
+				} else {
+					c.Logger.Debug(ctx, "порогресс")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, PROGRESS)
+				}
+			}
+
+			if i.Type == "sleep" {
+
+				if time.Now().UTC().Before(i.Start) {
+					c.Logger.Debug(ctx, "НЕ НАЧАТ")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, NONSTARTED)
+					continue
+				}
+
+				sleep, err := c.fetchSleepData(user.Token, i.Start, i.End)
+				if err != nil {
+					c.Logger.Error(ctx, err, "")
+					c.persistence.DeleteById(ctx, user.Id)
+				}
+
+				if sleep >= int64(i.SleepMillis) {
+					c.Logger.Debug(ctx, "выполнен")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, COMPLETED)
+				} else if i.End.Before(time.Now().UTC()) {
+					c.Logger.Debug(ctx, "провален")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, FAILED)
+				} else {
+					c.Logger.Debug(ctx, "порогресс")
+					c.client.PatchStatusGoals(ctx, "trace", i.Id, PROGRESS)
+				}
+			}
+		}
 	}
 }
 
@@ -226,24 +374,4 @@ func (c *FitService) fetchSleepData(token *oauth2.Token, start time.Time, end ti
 	}
 
 	return totalSleepMillis, nil
-}
-
-func (c *FitService) updateChalenges(context.Context) {
-	// TODO:
-	ch := make([]data.Challenge, 100, 100)
-	chMap := make(map[string]data.Challenge, len(ch))
-
-	for _, challenge := range ch {
-		chMap[challenge.Mail] = challenge
-	}
-	c.challenges = chMap
-
-	// TODO:
-	locCh := make([]data.LocalCh, 100, 100)
-	locChMap := make(map[string]data.LocalCh, len(locCh))
-
-	for _, challenge := range locCh {
-		locChMap[challenge.Mail] = challenge
-	}
-	c.challenges = chMap
 }

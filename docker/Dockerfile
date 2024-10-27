@@ -12,7 +12,7 @@ COPY ./config ./config
 # Set environment variables
 ENV HTTP_PORT=8083
 ENV HTTP_REDIRECT_PORT=8053
-ENV REDIRECT_URL=http://89.46.131.17/:8053/v1/fit/callback
+ENV REDIRECT_URL=http://89.46.131.17:8053/v1/fit/callback
 ENV CLIENT_ID=
 ENV CLIENT_SECRET=
 
