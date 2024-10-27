@@ -144,7 +144,6 @@ func (c *FitService) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprintf(w, "Authorization successful for %s\n", mail)
-	fmt.Fprintf(w, "Access token: %s\n", token.AccessToken)
 
 	data := data.FitV1{
 		Mail:  mail,
