@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	client1 "hack/client/version1"
@@ -126,6 +127,15 @@ func (c *FitService) GetCommandSet() *ccmd.CommandSet {
 }
 
 func (c *FitService) callbackHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	state := r.URL.Query().Get("state")
 	code := r.URL.Query().Get("code")
 
@@ -136,7 +146,16 @@ func (c *FitService) callbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	mail := state
 
-	token, err := c.oauthConfig.Exchange(context.Background(), code)
+	// Create an insecure HTTP client
+	insecureClient := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, insecureClient)
+
+	token, err := c.oauthConfig.Exchange(ctx, code)
 	if err != nil {
 		http.Error(w, "failed to exchange token: "+err.Error(), http.StatusInternalServerError)
 		c.Logger.Info(context.Background(), "failed to exchange token")
