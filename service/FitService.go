@@ -89,7 +89,7 @@ func NewFitService() *FitService {
 
 		c.worker(ctx, users)
 
-	}, 15000, 0, 1)
+	}, 40000, 0, 1)
 
 	go func() {
 		http.HandleFunc("/v1/fit/callback", c.callbackHandler)
